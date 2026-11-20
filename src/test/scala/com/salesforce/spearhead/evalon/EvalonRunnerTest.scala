@@ -179,16 +179,11 @@ class EvalonRunnerTest extends AnyFunSuite with BeforeAndAfterAll:
 
   test("a successful empty send is treated as silence, not an agent failure") {
     // Empty content is a real "say nothing": it must not become AgentStepFailedException.
-    // With nothing delivered, the conversation stalls and the run times out instead.
+    // With nothing delivered, the conversation stalls, so the run ends as idle and is scored.
     val agent: SimpleAgent = (_, _, _) => CompletableFuture.completedFuture(AgentReply.send(""))
-    val options = EvalonRunOptions()
-      .withSimulationTimeout(Duration.ofSeconds(2))
-      .withJudgeTimeout(Duration.ofSeconds(2))
-
-    val thrown = intercept[Throwable] {
-      evalon.runSimple(scenario("empty-send"), agent, judgeAndChatLlm, options)
-    }
-    assert(!thrown.isInstanceOf[AgentStepFailedException])
+    val result = evalon.runSimple(scenario("empty-send"), agent, judgeAndChatLlm, failFastOptions)
+    assert(result.getStopReason == StopReason.Idle)
+    assert(result.getSummary == "ok")
   }
 
   test("a simulated participant's LLM failure fails the run as a harness failure") {
@@ -374,6 +369,21 @@ class EvalonRunnerTest extends AnyFunSuite with BeforeAndAfterAll:
       Files.writeString(tmpPath, yaml)
       assert(EvalonRunner.loadScenario(tmpPath).observations.map(_.participant) == List("observer"))
     finally Files.deleteIfExists(tmpPath)
+  }
+
+  test("an event source declaring a reserved event name is rejected at run") {
+    val source = EventSourceConfig(
+      "case_events",
+      "simulated",
+      emits = List(EventEmitConfig(Event.AllWaiting))
+    )
+    val s = scenario("reserved-emit", eventSources = List(source))
+    val agent: SimpleAgent = (_, _, _) => CompletableFuture.completedFuture(AgentReply.end())
+    val ex = intercept[IllegalArgumentException] {
+      evalon.runSimple(s, agent, judgeAndChatLlm, failFastOptions)
+    }
+    assert(ex.getMessage.contains("reserved event name"))
+    assert(ex.getMessage.contains("case_events: all_waiting"))
   }
 
   test("a directly constructed scenario with a colliding event source is rejected at run") {

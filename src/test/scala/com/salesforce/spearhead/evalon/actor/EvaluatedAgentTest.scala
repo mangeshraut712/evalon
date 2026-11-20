@@ -19,10 +19,11 @@ package com.salesforce.spearhead.evalon.actor
 
 import java.util.concurrent.{LinkedBlockingQueue, TimeUnit}
 
+import scala.concurrent.duration.*
 import scala.concurrent.{Future, Promise}
 
 import io.circe.syntax.*
-import org.apache.pekko.actor.testkit.typed.scaladsl.ActorTestKit
+import org.apache.pekko.actor.testkit.typed.scaladsl.{ActorTestKit, FishingOutcomes, TestProbe}
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funsuite.AnyFunSuite
 
@@ -52,6 +53,13 @@ class EvaluatedAgentTest extends AnyFunSuite with BeforeAndAfterAll:
       assert(call != null, "expected another agent step")
       call
 
+  /** The next response the actor sends the runner, skipping its idle reports. */
+  private def expectResponse(runner: TestProbe[ScenarioRunner.Command]) =
+    runner.fishForMessagePF(5.seconds) {
+      case _: ScenarioRunner.Idle => FishingOutcomes.continueAndIgnore
+      case _: ScenarioRunner.ParticipantResponse => FishingOutcomes.complete
+    }
+
   private def observed(conversation: String, sender: String, content: String): Event =
     Event(
       "conversation_message",
@@ -65,7 +73,7 @@ class EvaluatedAgentTest extends AnyFunSuite with BeforeAndAfterAll:
   test("an observed message arriving mid-step triggers another step") {
     val runner = testKit.createTestProbe[ScenarioRunner.Command]()
     val agent = ControlledAgent()
-    val actor = testKit.spawn(EvaluatedAgent(agent, runner.ref, "agent", Set("assist")))
+    val actor = testKit.spawn(EvaluatedAgent(agent, runner.ref, "agent", Set("assist"), "agent"))
 
     actor ! Participant.ReceiveEvents(List(observed("chat", "end_user", "I want to cancel")))
     val first = agent.nextCall()
@@ -73,7 +81,7 @@ class EvaluatedAgentTest extends AnyFunSuite with BeforeAndAfterAll:
     // Arrives while the first step is still in flight.
     actor ! Participant.ReceiveEvents(List(observed("chat", "end_user", "Full refund please")))
     first.reply.success(Action.send("agent", "Look up the booking"))
-    runner.expectMessageType[ScenarioRunner.ParticipantResponse]
+    expectResponse(runner)
 
     val second = agent.nextCall()
     assert(second.respondIn == "assist")
@@ -83,14 +91,14 @@ class EvaluatedAgentTest extends AnyFunSuite with BeforeAndAfterAll:
     })
 
     second.reply.success(Action.send("agent", ""))
-    runner.expectMessageType[ScenarioRunner.ParticipantResponse]
+    expectResponse(runner)
     assert(agent.calls.poll(200, TimeUnit.MILLISECONDS) == null, "no further steps expected")
   }
 
   test("several observed messages mid-step coalesce into a single follow-up step") {
     val runner = testKit.createTestProbe[ScenarioRunner.Command]()
     val agent = ControlledAgent()
-    val actor = testKit.spawn(EvaluatedAgent(agent, runner.ref, "agent", Set("assist")))
+    val actor = testKit.spawn(EvaluatedAgent(agent, runner.ref, "agent", Set("assist"), "agent"))
 
     actor ! Participant.ReceiveEvents(List(observed("chat", "end_user", "hi")))
     val first = agent.nextCall()
@@ -98,11 +106,11 @@ class EvaluatedAgentTest extends AnyFunSuite with BeforeAndAfterAll:
     actor ! Participant.ReceiveEvents(List(observed("chat", "representative", "one moment")))
     actor ! Participant.ReceiveEvents(List(observed("chat", "end_user", "thanks")))
     first.reply.success(Action.send("agent", ""))
-    runner.expectMessageType[ScenarioRunner.ParticipantResponse]
+    expectResponse(runner)
 
     val second = agent.nextCall()
     assert(second.history.count(_.isInstanceOf[HistoryEntry.Turn]) == 3)
     second.reply.success(Action.send("agent", ""))
-    runner.expectMessageType[ScenarioRunner.ParticipantResponse]
+    expectResponse(runner)
     assert(agent.calls.poll(200, TimeUnit.MILLISECONDS) == null, "no further steps expected")
   }
