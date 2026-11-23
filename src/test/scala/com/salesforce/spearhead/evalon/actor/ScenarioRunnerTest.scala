@@ -207,27 +207,20 @@ class ScenarioRunnerTest extends AnyFunSuite with BeforeAndAfterAll:
     assert(!transcript.messages.exists(_.sender == "customer"))
   }
 
-  test("a run with two evaluated participants still completes as idle") {
-    // Both receive the user's message. Each must report idle under its own name, or the runner's
-    // count for the second never matches and the run hangs.
+  test("a runner for two evaluated participants is rejected when built, not run as one") {
+    // Direct callers bypass EvalonRunner's validation. Throwing when the behavior is built, not
+    // when it starts, also keeps a caller from waiting on a runner that never replies.
     val base = scenario()
-    val twoAgents = base.copy(
-      participants = Map(
-        "end_user" -> ParticipantConfig("end_user", ParticipantType.Simulated),
-        "agent" -> ParticipantConfig("agent", ParticipantType.Evaluated),
-        "supervisor" -> ParticipantConfig("supervisor", ParticipantType.Evaluated)
-      ),
-      conversations = List(
-        ConversationConfig(
-          "chat",
-          List("end_user", "agent", "supervisor"),
-          initiatedBy = Some("end_user")
-        )
+    val twoAgents = base.copy(participants =
+      base.participants.updated(
+        "supervisor",
+        ParticipantConfig("supervisor", ParticipantType.Evaluated)
       )
     )
-    val agent = ScriptedAgent((_, _) => silent)
-    val (_, probe) = run(twoAgents, agent, userLlm)
-    assert(expectCompleted(probe)._2 == StopReason.Idle)
+    val ex = intercept[IllegalArgumentException] {
+      ScenarioRunner(twoAgents, ScriptedAgent((_, _) => silent), userLlm)
+    }
+    assert(ex.getMessage.contains("only one evaluated participant"))
   }
 
   test("[END] and max_turns report their stop reasons") {
