@@ -28,7 +28,7 @@ import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funsuite.AnyFunSuite
 
 import com.salesforce.spearhead.evalon.agent.{Agent, AgentReply, SimpleAgent}
-import com.salesforce.spearhead.evalon.llm.Llm
+import com.salesforce.spearhead.evalon.llm.{Llm, TestLlm}
 import com.salesforce.spearhead.evalon.model.*
 
 class EvalonRunnerTest extends AnyFunSuite with BeforeAndAfterAll:
@@ -41,7 +41,7 @@ class EvalonRunnerTest extends AnyFunSuite with BeforeAndAfterAll:
     Await.ready(system.whenTerminated, 30.seconds)
 
   test("sequential runs reuse one caller-owned actor system") {
-    val llm: Llm = (system, messages) =>
+    val llm: Llm = TestLlm: (system, messages) =>
       val prompt = (system +: messages.map(_.content)).mkString("\n")
       val text =
         if prompt.contains("expert evaluator") then
@@ -125,7 +125,7 @@ class EvalonRunnerTest extends AnyFunSuite with BeforeAndAfterAll:
 
   // A judge LLM that scores every run "ok", and drives the simulated user to say something
   // (so the evaluated agent actually gets a turn) rather than ending immediately.
-  private val judgeAndChatLlm: Llm = (system, messages) =>
+  private val judgeAndChatLlm: Llm = TestLlm: (system, messages) =>
     val prompt = (system +: messages.map(_.content)).mkString("\n")
     val text =
       if prompt.contains("expert evaluator") then """{"passed":true,"reasoning":"ok"}"""
@@ -203,21 +203,17 @@ class EvalonRunnerTest extends AnyFunSuite with BeforeAndAfterAll:
 
   test("a successful empty send is treated as silence, not an agent failure") {
     // Empty content is a real "say nothing": it must not become AgentStepFailedException.
-    // With nothing delivered, the conversation stalls and the run times out instead.
+    // With nothing delivered, the conversation stalls, so the run ends as idle and is scored.
     val agent: SimpleAgent = (_, _, _) => CompletableFuture.completedFuture(AgentReply.send(""))
-    val options = EvalonRunOptions()
-      .withSimulationTimeout(Duration.ofSeconds(2))
-      .withJudgeTimeout(Duration.ofSeconds(2))
-
-    val thrown = intercept[Throwable] {
-      evalon.runSimple(scenario("empty-send"), agent, judgeAndChatLlm, options)
-    }
-    assert(!thrown.isInstanceOf[AgentStepFailedException])
+    val result = evalon.runSimple(scenario("empty-send"), agent, judgeAndChatLlm, failFastOptions)
+    assert(result.getStopReason == StopReason.Idle)
+    assert(result.getSummary == "ok")
   }
 
   test("a simulated participant's LLM failure fails the run as a harness failure") {
     // The failing participant is not the agent under test, so it surfaces as a harness failure.
-    val llm: Llm = (_, _) => CompletableFuture.failedFuture(new IllegalStateException("llm down"))
+    val llm: Llm =
+      TestLlm((_, _) => CompletableFuture.failedFuture(new IllegalStateException("llm down")))
     val agent: SimpleAgent = (_, _, _) => CompletableFuture.completedFuture(AgentReply.end())
 
     val ex = intercept[SimulationFailedException] {
@@ -236,7 +232,7 @@ class EvalonRunnerTest extends AnyFunSuite with BeforeAndAfterAll:
     )
     // Fail only the event source's LLM call; keep the user and agent talking (never ending) so the
     // event-source failure is the only thing that can stop the run.
-    val llm: Llm = (system, messages) =>
+    val llm: Llm = TestLlm: (system, messages) =>
       val prompt = (system +: messages.map(_.content)).mkString("\n")
       if prompt.contains("simulated event source") then
         CompletableFuture.failedFuture(new IllegalStateException("event source down"))
@@ -286,7 +282,7 @@ class EvalonRunnerTest extends AnyFunSuite with BeforeAndAfterAll:
   }
 
   test("a participant LLM that throws synchronously fails the run as a harness failure") {
-    val llm: Llm = (_, _) => throw new IllegalStateException("sync llm boom")
+    val llm: Llm = _ => throw new IllegalStateException("sync llm boom")
     val agent: SimpleAgent = (_, _, _) => CompletableFuture.completedFuture(AgentReply.end())
     val ex = intercept[SimulationFailedException] {
       evalon.runSimple(scenario("raw-sync-llm"), agent, llm, failFastOptions)
@@ -296,7 +292,7 @@ class EvalonRunnerTest extends AnyFunSuite with BeforeAndAfterAll:
   }
 
   test("a participant LLM that returns null fails the run as a harness failure") {
-    val llm: Llm = (_, _) => null
+    val llm: Llm = _ => null
     val agent: SimpleAgent = (_, _, _) => CompletableFuture.completedFuture(AgentReply.end())
     val ex = intercept[SimulationFailedException] {
       evalon.runSimple(scenario("raw-null-llm"), agent, llm, failFastOptions)
@@ -398,6 +394,68 @@ class EvalonRunnerTest extends AnyFunSuite with BeforeAndAfterAll:
       Files.writeString(tmpPath, yaml)
       assert(EvalonRunner.loadScenario(tmpPath).observations.map(_.participant) == List("observer"))
     finally Files.deleteIfExists(tmpPath)
+  }
+
+  test("a scenario with two evaluated participants is rejected at load") {
+    import java.nio.file.Files
+    val yaml = """
+      |name: two-evaluated-test
+      |description: two agents under test
+      |participants:
+      |  end_user:
+      |    type: simulated
+      |  agent:
+      |    type: evaluated
+      |  supervisor:
+      |    type: evaluated
+      |conversations:
+      |  - name: chat
+      |    between: [end_user, agent]
+      |    initiated_by: end_user
+      |  - name: escalation
+      |    between: [agent, supervisor]
+      |eval_criteria:
+      |  - name: ok
+      |    description: ok
+      |""".stripMargin
+    val tmpPath = Files.createTempFile("two-evaluated-scenario-", ".yaml")
+    try
+      Files.writeString(tmpPath, yaml)
+      val ex = intercept[RuntimeException] {
+        EvalonRunner.loadScenario(tmpPath)
+      }
+      assert(ex.getMessage.contains("agent, supervisor"))
+    finally Files.deleteIfExists(tmpPath)
+  }
+
+  test("a directly constructed scenario with two evaluated participants is rejected at run") {
+    val base = scenario("direct-two-evaluated")
+    val s = base.copy(participants =
+      base.participants.updated(
+        "supervisor",
+        ParticipantConfig("supervisor", ParticipantType.Evaluated)
+      )
+    )
+    val agent: SimpleAgent = (_, _, _) => CompletableFuture.completedFuture(AgentReply.end())
+    val ex = intercept[IllegalArgumentException] {
+      evalon.runSimple(s, agent, judgeAndChatLlm, failFastOptions)
+    }
+    assert(ex.getMessage.contains("only one evaluated participant"))
+  }
+
+  test("an event source declaring a reserved event name is rejected at run") {
+    val source = EventSourceConfig(
+      "case_events",
+      "simulated",
+      emits = List(EventEmitConfig(Event.AllWaiting))
+    )
+    val s = scenario("reserved-emit", eventSources = List(source))
+    val agent: SimpleAgent = (_, _, _) => CompletableFuture.completedFuture(AgentReply.end())
+    val ex = intercept[IllegalArgumentException] {
+      evalon.runSimple(s, agent, judgeAndChatLlm, failFastOptions)
+    }
+    assert(ex.getMessage.contains("reserved event name"))
+    assert(ex.getMessage.contains("case_events: all_waiting"))
   }
 
   test("a directly constructed scenario with a colliding event source is rejected at run") {

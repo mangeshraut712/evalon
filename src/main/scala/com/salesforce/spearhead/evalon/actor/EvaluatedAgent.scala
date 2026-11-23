@@ -25,7 +25,7 @@ import org.apache.pekko.actor.typed.scaladsl.{ActorContext, Behaviors}
 import org.apache.pekko.actor.typed.{ActorRef, Behavior}
 
 import com.salesforce.spearhead.evalon.agent.Agent
-import com.salesforce.spearhead.evalon.model.{Action, Event, HistoryEntry}
+import com.salesforce.spearhead.evalon.model.{Action, Event, HistoryEntry, Message}
 
 /**
  * Wraps the Agent trait as a Pekko actor, bridging actor messages to Future-based calls.
@@ -51,13 +51,27 @@ object EvaluatedAgent:
    */
   private case class Pending(conversations: Set[String], events: List[Event])
 
+  private type Delivery = Participant.ReceiveMessage | Participant.Kickoff
+
+  /** A delivered message and its conversation, with a kickoff read as the system's opening turn. */
+  private def delivered(delivery: Delivery): (Message, String) = delivery match
+    case Participant.ReceiveMessage(msg, conversation) => (msg, conversation)
+    case Participant.Kickoff(conversation) => (Participant.KickoffMessage, conversation)
+
   def apply(
       agent: Agent,
       runner: ActorRef[ScenarioRunner.Command],
       agentName: String,
-      directConversations: Set[String]
+      directConversations: Set[String],
+      participantName: String
   ): Behavior[Participant.Command | AgentResult] =
-    idle(agent, runner, agentName, directConversations, Nil)
+    // Idle reports must carry this actor's own participant name, which the runner counts its
+    // deliveries under. `agentName` can differ when a scenario has several evaluated participants.
+    Behaviors.setup { _ =>
+      given reporter: IdleReporter = IdleReporter(participantName, runner)
+      reporter.reportIdle() // steps only on deliveries
+      idle(agent, runner, agentName, directConversations, Nil)
+    }
 
   private def idle(
       agent: Agent,
@@ -65,8 +79,11 @@ object EvaluatedAgent:
       agentName: String,
       directConversations: Set[String],
       history: List[HistoryEntry]
-  ): Behavior[Participant.Command | AgentResult] = Behaviors.receive {
-    case (ctx, Participant.ReceiveMessage(msg, conversation)) =>
+  )(using reporter: IdleReporter): Behavior[Participant.Command | AgentResult] = Behaviors.receive {
+    // Every delivery while idle starts a step, so idle is reported when that step finishes.
+    case (ctx, delivery: Delivery) =>
+      reporter.received()
+      val (msg, conversation) = delivered(delivery)
       val newHistory =
         history :+ HistoryEntry.Turn(conversation, msg.sender, msg.content, msg.trace)
       startStep(
@@ -82,6 +99,7 @@ object EvaluatedAgent:
       )
 
     case (ctx, Participant.ReceiveEvents(events)) =>
+      reporter.received()
       val (newHistory, systemEvents) = absorbEvents(history, events)
       startStep(
         agent,
@@ -106,7 +124,7 @@ object EvaluatedAgent:
       history: List[HistoryEntry],
       events: List[Event]
   ): (List[HistoryEntry], List[Event]) =
-    val (convEvents, systemEvents) = events.partition(_.name == "conversation_message")
+    val (convEvents, systemEvents) = events.partition(_.name == Event.ConversationMessage)
     val turns = convEvents.map { e =>
       val conv = e.data.get("conversation").flatMap(_.asString).getOrElse("unknown")
       val sender = e.data.get("sender").flatMap(_.asString).getOrElse("unknown")
@@ -142,19 +160,22 @@ object EvaluatedAgent:
       directConversations: Set[String],
       history: List[HistoryEntry],
       pending: Pending
-  ): Behavior[Participant.Command | AgentResult] = Behaviors.receive {
-    case (_, Participant.ReceiveMessage(msg, conversation)) =>
+  )(using reporter: IdleReporter): Behavior[Participant.Command | AgentResult] = Behaviors.receive {
+    case (_, delivery: Delivery) =>
+      reporter.received()
+      val (msg, conversation) = delivered(delivery)
       val newHistory =
         history :+ HistoryEntry.Turn(conversation, msg.sender, msg.content, msg.trace)
       val newPending = pending.copy(conversations = pending.conversations + conversation)
       generating(agent, runner, agentName, directConversations, newHistory, newPending)
 
     case (_, Participant.ReceiveEvents(events)) =>
+      reporter.received()
       val (newHistory, systemEvents) = absorbEvents(history, events)
       // Observed conversation messages become history, not pending events, so on their own they
       // would not trigger another step. Queue one in the agent's direct conversation (matching
       // idle's handling) so the agent gets to react to what it observed mid-step.
-      val observedTurns = events.exists(_.name == "conversation_message")
+      val observedTurns = events.exists(_.name == Event.ConversationMessage)
       val newConversations =
         if observedTurns then pending.conversations + directConversations.head
         else pending.conversations
@@ -211,6 +232,7 @@ object EvaluatedAgent:
             ctx
           )
         case None =>
+          reporter.reportIdle()
           idle(agent, runner, agentName, directConversations, newHistory)
   }
 
@@ -224,7 +246,7 @@ object EvaluatedAgent:
       respondIn: String,
       pending: Pending,
       ctx: ActorContext[Participant.Command | AgentResult]
-  ): Behavior[Participant.Command | AgentResult] =
+  )(using IdleReporter): Behavior[Participant.Command | AgentResult] =
     ctx.pipeToSelf(safeStep(agent, history, events, respondIn))(AgentResult(_, respondIn))
     generating(agent, runner, agentName, directConversations, history, pending)
 

@@ -25,7 +25,6 @@ import io.circe.syntax.*
  * use these exact strings.
  */
 object Signals:
-  val NoQuestion = "[NO_QUESTION]"
   val NoAction = "[NO_ACTION]"
   val End = "[END]"
 
@@ -85,6 +84,18 @@ object ToolResult:
 case class Event(name: String, data: Map[String, Json] = Map.empty)
 
 object Event:
+
+  /** Sent by the runner to the evaluated agent when every participant is waiting. */
+  val AllWaiting = "all_waiting"
+
+  /** Used by the runner to forward observed conversation messages to observers. */
+  val ConversationMessage = "conversation_message"
+
+  /**
+   * Event names the harness itself sends. Event sources may not emit them: the loader rejects them
+   * in `emits`, and the runner drops them from emissions, so they can't be impersonated.
+   */
+  val ReservedNames: Set[String] = Set(AllWaiting, ConversationMessage)
   given Encoder[Event] = Encoder.instance { e =>
     Json.obj("name" -> e.name.asJson, "data" -> e.data.asJson)
   }

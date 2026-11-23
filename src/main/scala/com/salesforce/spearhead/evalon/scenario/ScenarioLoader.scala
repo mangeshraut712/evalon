@@ -36,8 +36,26 @@ object ScenarioLoader:
   def validateScenario(scenario: Scenario): Either[String, Unit] =
     for
       _ <- validateEventSourceNames(scenario)
+      _ <- validateEmittedEventNames(scenario)
+      _ <- validateSingleEvaluated(scenario)
       _ <- validateObserverParticipants(scenario)
     yield ()
+
+  private def validateSingleEvaluated(scenario: Scenario): Either[String, Unit] =
+    // The runner runs every evaluated participant as the first one: one name, one set of
+    // conversations, one shared Agent. Reject the scenario rather than misattribute its messages.
+    val evaluated = scenario.participants
+      .collect {
+        case (name, p) if p.participantType == ParticipantType.Evaluated => name
+      }
+      .toList
+      .sorted
+    if evaluated.size > 1 then
+      Left(
+        s"Scenario has ${evaluated.size} evaluated participants (${evaluated.mkString(", ")}), " +
+          "but only one evaluated participant is supported. Make the others simulated."
+      )
+    else Right(())
 
   private def validateEventSourceNames(scenario: Scenario): Either[String, Unit] =
     val participantNames = scenario.participants.keySet
@@ -47,6 +65,19 @@ object ScenarioLoader:
       Left(
         s"Event source name(s) collide with participant name(s): ${collisions.mkString(", ")}. " +
           "Event sources and participants must have distinct names to avoid failure misclassification."
+      )
+    else Right(())
+
+  private def validateEmittedEventNames(scenario: Scenario): Either[String, Unit] =
+    val reserved = for
+      source <- scenario.eventSources
+      emit <- source.emits
+      if Event.ReservedNames.contains(emit.event)
+    yield s"${source.name}: ${emit.event}"
+    if reserved.nonEmpty then
+      Left(
+        s"Event source(s) declare reserved event name(s): ${reserved.mkString(", ")}. " +
+          s"${Event.ReservedNames.toList.sorted.mkString(", ")} are sent by the harness itself."
       )
     else Right(())
 

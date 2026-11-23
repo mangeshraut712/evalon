@@ -18,31 +18,33 @@
 package com.salesforce.spearhead.evalon.actor
 
 import scala.concurrent.duration.*
-import scala.util.{Failure, Random, Success}
+import scala.util.{Failure, Random, Success, Try}
 
+import io.circe.Json
+import io.circe.syntax.*
 import org.apache.pekko.actor.typed.scaladsl.{ActorContext, Behaviors, TimerScheduler}
 import org.apache.pekko.actor.typed.{ActorRef, Behavior}
 
-import com.salesforce.spearhead.evalon.llm.{ChatMessage, Llm}
+import com.salesforce.spearhead.evalon.llm.{ChatMessage, Llm, LlmRequest, LlmResponse, LlmTool}
 import com.salesforce.spearhead.evalon.model.{
   Action,
   ConversationConfig,
   Message,
   ParticipantConfig,
-  ResponseSpeed,
-  Signals
+  ResponseSpeed
 }
 
 /**
  * An LLM-driven participant that plays a role in the simulation.
  *
- * Three states: idle → thinking → generating.
+ * It keeps one timeline of everything said in its conversations. Whenever something from another
+ * participant is newer than the last prompt it built, it takes a turn: the model sees the whole
+ * timeline, with new lines marked, and acts only through tool calls. It may send several messages,
+ * to any of its conversations, in one turn, or call nothing and stay silent.
  *
- * Thinking simulates the participant absorbing incoming messages. If a new message arrives during
- * thinking, the timer resets (the participant waits to see if more is coming). Once the timer
- * fires, the participant enters generating (LLM call in flight). Messages arriving during
- * generation are queued. After generation, the participant always re-enters thinking before the
- * next LLM call, giving the full delay again.
+ * Three states: idle → thinking → generating. Thinking simulates absorbing incoming messages: a new
+ * message resets the `response_speed` delay. Messages arriving during generation are added to the
+ * timeline; if any is from someone else, another turn follows, after the full delay again.
  */
 object SimulatedParticipant:
 
@@ -50,89 +52,75 @@ object SimulatedParticipant:
       config: ParticipantConfig,
       llm: Llm,
       runner: ActorRef[ScenarioRunner.Command],
-      conversations: Map[String, ConversationConfig]
+      conversations: List[ConversationConfig],
+      idleReporter: IdleReporter
   )
 
-  // Internal command (LLM results come back via pipeToSelf)
-  private[actor] case class LlmResult(conversation: String, kind: ResponseKind)
+  /**
+   * One line of the timeline. The participant's own lines have its name as `sender` and are seen
+   * from the start; others' lines are seen once a prompt has shown them. A `kickoff` line is the
+   * runner opening the conversation, not anyone's message.
+   */
+  private case class Line(
+      conversation: String,
+      sender: String,
+      content: String,
+      seen: Boolean,
+      kickoff: Boolean = false
+  )
+
+  private case class History(lines: Vector[Line]):
+    def add(line: Line): History = copy(lines = lines :+ line)
+    def markSeen(conversations: Set[String]): History =
+      copy(lines = lines.map(l => if conversations(l.conversation) then l.copy(seen = true) else l))
+    def hasUnseen: Boolean = lines.exists(!_.seen)
+
+    /** The earliest conversation whose kickoff the participant hasn't had a turn for yet. */
+    def nextKickoff: Option[String] =
+      lines.collectFirst { case l if !l.seen && l.kickoff => l.conversation }
+
+  /** What one turn asked for, after validating the model's tool calls. */
+  private[actor] enum TurnAction:
+    case Send(conversation: String, text: String)
+    case End
+
+  // Internal command: an LLM call finished. Carries what's needed to validate and retry it.
+  private[actor] case class TurnResult(
+      request: LlmRequest,
+      allowed: List[String],
+      attempt: Int,
+      result: Try[LlmResponse]
+  )
 
   // Internal command (timer fires after thinking delay)
   private[actor] case object ThinkingComplete
 
-  private[actor] enum ResponseKind:
-    case Text(content: String)
-    case TextThenEnd(content: String) // final message before ending
-    case End
-    case Silent // nothing to say (e.g. [NO_QUESTION])
-    case Failed(cause: Throwable) // LLM call failed terminally; surfaced, not swallowed
-
-  /**
-   * Per-cycle metadata. A cycle begins when idle receives a message and ends when the actor returns
-   * to idle. Pending tracks reactive responses owed to convs that received input during an
-   * in-flight generation; proactiveAttempted prevents re-visiting the same conv proactively;
-   * historyAtCycleStart anchors the cross-conv activity check that drives proactive follow-ups.
-   */
-  private case class CycleState(
-      pending: Set[String],
-      proactiveAttempted: Set[String],
-      historyAtCycleStart: Map[String, List[ChatMessage]]
-  )
-
-  private def buildSystemPrompt(
-      config: ParticipantConfig,
-      conversation: String,
-      conversations: Map[String, ConversationConfig],
-      history: Map[String, List[ChatMessage]]
-  ): String =
-    val conv = conversations.get(conversation)
-    val others = conv.map(_.between.filter(_ != config.name).mkString(", ")).getOrElse("unknown")
-
-    // Surface the participant's *other* active conversations so it has cross-conversation context.
-    // Only threads with at least one message are included; empty when this is the participant's
-    // only conversation with any history (e.g. the first turn), so it appends nothing.
-    val contextSection = history.collect {
-      case (convName, convHistory) if convName != conversation && convHistory.nonEmpty =>
-        val otherParticipants = conversations
-          .get(convName)
-          .map(_.between.filter(_ != config.name).mkString(", "))
-          .getOrElse("unknown")
-        val lines = convHistory.map(_.content).mkString("\n")
-        s"""\n\nYou also have an ongoing conversation in "$convName" with $otherParticipants. Recent messages there:\n$lines"""
-    }.mkString
-
-    val endInstruction =
-      s"Use ${Signals.End} ONLY when the conversation is genuinely complete: your goal has been achieved or the other party has clearly wrapped up. Never include ${Signals.End} while you are mid-task, waiting for information, or correcting yourself. When in doubt, do not end."
-
-    config.template.map(_.trim).filter(_.nonEmpty) match
-      case Some(template) =>
-        s"$template\n\n$endInstruction$contextSection"
-      case None =>
-        s"""You are role-playing as a simulated participant.
-
-Your name/role: ${config.name}
-Your persona: ${config.persona}
-Your goal: ${config.goal}
-
-You are currently responding in the "$conversation" conversation with: $others
-Address your response to them. Do NOT address participants from other conversations here.
-Stay in character. Respond naturally based on the conversation so far.
-
-$endInstruction
-
-Respond with only your message content. Your output is delivered to the other party as-is.$contextSection"""
-
-  type Cmd = Participant.Command | LlmResult | ThinkingComplete.type
+  type Cmd = Participant.Command | TurnResult | ThinkingComplete.type
 
   private val ThinkingTimerKey = "thinking"
 
+  private[actor] val SendMessage = "send_message"
+  private[actor] val EndConversation = "end_conversation"
+
+  /** Retries of a turn whose tool calls were invalid, before the run fails. */
+  private val MaxRetries = 1
+
+  /**
+   * `conversations` is the scenario's conversations by name; the participant keeps those it is in.
+   * It is required: a participant with none has nowhere to post and would stay silent forever.
+   */
   def apply(
       config: ParticipantConfig,
       llm: Llm,
       runner: ActorRef[ScenarioRunner.Command],
-      conversations: Map[String, ConversationConfig] = Map.empty
+      conversations: Map[String, ConversationConfig]
   ): Behavior[Cmd] =
-    val setup = Setup(config, llm, runner, conversations)
-    Behaviors.withTimers(timers => idle(setup, Map.empty, timers))
+    Behaviors.setup { _ =>
+      val mine = conversations.values.filter(_.between.contains(config.name)).toList.sortBy(_.name)
+      val setup = Setup(config, llm, runner, mine, IdleReporter(config.name, runner))
+      setup.idleReporter.reportIdle() // waits for a message before it speaks
+      Behaviors.withTimers(timers => idle(setup, History(Vector.empty), timers))
+    }
 
   private def thinkingDelay(setup: Setup): FiniteDuration =
     setup.config.responseSpeed match
@@ -141,283 +129,358 @@ Respond with only your message content. Your output is delivered to the other pa
       case Some(ResponseSpeed.Slow) => (8000 + Random.nextInt(2000)).millis
       case None => 0.millis
 
+  /** Add a delivery to the timeline: a message, or a kickoff (see [[Line]]). */
+  private def received(setup: Setup, history: History, delivery: Participant.Command) =
+    setup.idleReporter.received()
+    delivery match
+      case Participant.ReceiveMessage(msg, conversation) =>
+        val own = msg.sender == setup.config.name
+        history.add(Line(conversation, msg.sender, msg.content, seen = own))
+      case Participant.Kickoff(conversation) =>
+        val kickoff = Participant.KickoffMessage
+        history.add(
+          Line(conversation, kickoff.sender, kickoff.content, seen = false, kickoff = true)
+        )
+      case Participant.ReceiveEvents(_) => history
+
+  /** Return to idle, telling the runner (for idle detection). */
+  private def goIdle(setup: Setup, history: History, timers: TimerScheduler[Cmd]): Behavior[Cmd] =
+    setup.idleReporter.reportIdle()
+    idle(setup, history, timers)
+
   /** Idle state — waiting for messages. */
   private def idle(
       setup: Setup,
-      history: Map[String, List[ChatMessage]],
+      history: History,
       timers: TimerScheduler[Cmd]
   ): Behavior[Cmd] = Behaviors.receive {
-    case (ctx, Participant.ReceiveMessage(msg, conversation)) =>
-      val newHistory = appendToHistory(setup.config, history, msg, conversation)
-      val cycle = CycleState(
-        pending = Set.empty,
-        proactiveAttempted = Set.empty,
-        historyAtCycleStart = newHistory
-      )
-      enterThinking(setup, newHistory, conversation, cycle, timers, ctx)
+    case (ctx, delivery @ (_: Participant.ReceiveMessage | _: Participant.Kickoff)) =>
+      enterThinking(setup, received(setup, history, delivery), timers, ctx)
 
     case (_, Participant.ReceiveEvents(_)) =>
       // Gap: simulated participants currently ignore observed events. Adding event handling
       // will require deciding how events feed into prompt context and what should trigger a
-      // generation. Deferred until a concrete scenario needs it.
+      // turn. Deferred until a concrete scenario needs it.
+      // Still idle after handling a delivery, so say so: the runner counted it.
+      setup.idleReporter.received()
+      setup.idleReporter.reportIdle()
       Behaviors.same
 
-    case (ctx, result: LlmResult) =>
-      ctx.log.error("Unexpected LlmResult in idle state: {}", result)
+    case (ctx, result: TurnResult) =>
+      ctx.log.error("Unexpected TurnResult in idle state: {}", result)
       Behaviors.same
 
     case (_, ThinkingComplete) =>
       Behaviors.same
   }
 
-  /** Enter thinking: schedule the delay (or skip straight to generating if no delay configured). */
+  /** Enter thinking: schedule the delay (or skip straight to the turn if no delay configured). */
   private def enterThinking(
       setup: Setup,
-      history: Map[String, List[ChatMessage]],
-      conversation: String,
-      cycle: CycleState,
+      history: History,
       timers: TimerScheduler[Cmd],
       ctx: ActorContext[Cmd]
   ): Behavior[Cmd] =
     val delay = thinkingDelay(setup)
     if delay > 0.millis then
-      ctx.log.info(
-        "{} entering thinking for {} ({}ms)",
-        setup.config.name,
-        conversation,
-        delay.toMillis
-      )
+      ctx.log.info("{} entering thinking ({}ms)", setup.config.name, delay.toMillis)
       timers.startSingleTimer(ThinkingTimerKey, ThinkingComplete, delay)
-      thinking(setup, history, conversation, cycle, timers)
-    else startGeneration(setup, history, conversation, cycle, timers, ctx)
+      thinking(setup, history, timers)
+    else startTurn(setup, history, timers, ctx)
 
   /** Thinking state — absorbing messages, timer running. Resets on any new input. */
   private def thinking(
       setup: Setup,
-      history: Map[String, List[ChatMessage]],
-      activeConversation: String,
-      cycle: CycleState,
+      history: History,
       timers: TimerScheduler[Cmd]
   ): Behavior[Cmd] = Behaviors.receive {
-
-    case (ctx, Participant.ReceiveMessage(msg, conversation)) =>
-      val newHistory = appendToHistory(setup.config, history, msg, conversation)
-
-      val newCycle =
-        if conversation == activeConversation then cycle
-        else cycle.copy(pending = cycle.pending + conversation)
-
+    case (ctx, delivery @ (_: Participant.ReceiveMessage | _: Participant.Kickoff)) =>
       val delay = thinkingDelay(setup)
-      ctx.log.info(
-        "{} resetting thinking timer (incoming in {}, {}ms)",
-        setup.config.name,
-        conversation,
-        delay.toMillis
-      )
-
+      ctx.log.info("{} resetting thinking timer ({}ms)", setup.config.name, delay.toMillis)
       timers.startSingleTimer(ThinkingTimerKey, ThinkingComplete, delay)
-      thinking(setup, newHistory, activeConversation, newCycle, timers)
+      thinking(setup, received(setup, history, delivery), timers)
 
     case (ctx, ThinkingComplete) =>
-      ctx.log.info(
-        "{} thinking complete, starting generation for {}",
-        setup.config.name,
-        activeConversation
-      )
-      startGeneration(setup, history, activeConversation, cycle, timers, ctx)
+      ctx.log.info("{} thinking complete, starting turn", setup.config.name)
+      startTurn(setup, history, timers, ctx)
 
     case (_, Participant.ReceiveEvents(_)) =>
       // Gap: see idle's ReceiveEvents handler.
+      setup.idleReporter.received()
       Behaviors.same
 
-    case (ctx, result: LlmResult) =>
-      ctx.log.error("Unexpected LlmResult in thinking state: {}", result)
+    case (ctx, result: TurnResult) =>
+      ctx.log.error("Unexpected TurnResult in thinking state: {}", result)
       Behaviors.same
   }
 
-  /** Generating state — LLM call in flight. Accumulate incoming messages. */
+  /** Conversations that have started: no initiator, or the initiator has spoken there. */
+  private def startedConversations(setup: Setup, history: History): Set[String] =
+    setup.conversations.collect {
+      case conv
+          if conv.initiatedBy.forall(initiator =>
+            history.lines.exists(line =>
+              line.conversation == conv.name && line.sender == initiator && !line.kickoff
+            )
+          ) =>
+        conv.name
+    }.toSet
+
+  /**
+   * Conversations the participant may post in on an ordinary turn: those that have started, and
+   * those it initiates.
+   */
+  private def allowedConversations(setup: Setup, started: Set[String]): List[String] =
+    setup.conversations.collect {
+      case conv if started(conv.name) || conv.initiatedBy.contains(setup.config.name) => conv.name
+    }
+
+  private def startTurn(
+      setup: Setup,
+      history: History,
+      timers: TimerScheduler[Cmd],
+      ctx: ActorContext[Cmd]
+  ): Behavior[Cmd] =
+    // A kickoff turn opens one conversation, offered alone: offered anything else, the opening
+    // line could go to the wrong one. It shows and marks seen only that conversation, so anything
+    // that arrived meanwhile, including another kickoff, is still new and gets the next turn.
+    val opening = history.nextKickoff
+    val shown = opening.fold(setup.conversations.map(_.name).toSet)(Set(_))
+    val started = startedConversations(setup, history)
+    val allowed = opening.fold(allowedConversations(setup, started))(List(_))
+    if allowed.isEmpty then
+      ctx.log.info("{} has no conversation it may post in yet", setup.config.name)
+      goIdle(setup, history.markSeen(shown), timers)
+    else
+      val timeline = renderTimeline(setup.config.name, history, shown, opening)
+      val request = LlmRequest(
+        system = buildSystemPrompt(setup.config, setup.conversations, started),
+        messages = List(ChatMessage.user(timeline)),
+        tools = turnTools(allowed)
+      )
+      call(setup, request, allowed, attempt = 0, ctx)
+      generating(setup, history.markSeen(shown), timers)
+
+  private def call(
+      setup: Setup,
+      request: LlmRequest,
+      allowed: List[String],
+      attempt: Int,
+      ctx: ActorContext[Cmd]
+  ): Unit =
+    ctx.pipeToSelf(setup.llm.completeAsync(request))(TurnResult(request, allowed, attempt, _))
+
+  /** Generating state — LLM call in flight. Incoming messages join the timeline. */
   private def generating(
       setup: Setup,
-      history: Map[String, List[ChatMessage]],
-      activeConversation: String,
-      cycle: CycleState,
+      history: History,
       timers: TimerScheduler[Cmd]
   ): Behavior[Cmd] = Behaviors.receive {
-    case (_, Participant.ReceiveMessage(msg, conversation)) =>
-      val newHistory = appendToHistory(setup.config, history, msg, conversation)
-      val newPending =
-        if conversation == activeConversation then cycle.pending
-        else cycle.pending + conversation
-      generating(setup, newHistory, activeConversation, cycle.copy(pending = newPending), timers)
+    case (_, delivery @ (_: Participant.ReceiveMessage | _: Participant.Kickoff)) =>
+      generating(setup, received(setup, history, delivery), timers)
 
     case (_, Participant.ReceiveEvents(_)) =>
       // Gap: see idle's ReceiveEvents handler.
+      setup.idleReporter.received()
       Behaviors.same
 
     case (_, ThinkingComplete) =>
       Behaviors.same
 
-    case (ctx, LlmResult(conversation, kind)) =>
-      // Notifies the runner of a text message and appends it to local history.
-      // Shared by Text and TextThenEnd, which differ only in what follows.
-      def sendText(text: String): Map[String, List[ChatMessage]] =
-        val msgs = history.getOrElse(conversation, Nil)
-        setup.runner ! ScenarioRunner.ParticipantResponse(
-          setup.config.name,
-          conversation,
-          Action.Send(Message(setup.config.name, text))
-        )
-        history + (conversation -> (msgs :+ ChatMessage.assistant(text)))
+    case (ctx, TurnResult(_, _, _, Failure(cause))) =>
+      // A failed simulator LLM call is a broken harness, not a real "say nothing". Fail the
+      // run fast instead of leaving this participant silently mute.
+      ctx.log.error("LLM call failed for participant {}", setup.config.name, cause)
+      fail(setup, cause)
 
-      val updatedCycle =
-        cycle.copy(proactiveAttempted = cycle.proactiveAttempted + conversation)
-
-      kind match
-        case ResponseKind.Text(text) =>
-          val newHistory = sendText(text)
-          processPostGeneration(setup, newHistory, updatedCycle, timers, ctx)
-
-        case ResponseKind.TextThenEnd(text) =>
-          val newHistory = sendText(text)
-          setup.runner ! ScenarioRunner.ParticipantResponse(
-            setup.config.name,
-            conversation,
-            Action.End
-          )
-          idle(setup, newHistory, timers)
-
-        case ResponseKind.End =>
-          setup.runner ! ScenarioRunner.ParticipantResponse(
-            setup.config.name,
-            conversation,
-            Action.End
-          )
-          idle(setup, history, timers)
-
-        case ResponseKind.Silent =>
-          ctx.log.debug("{} responded [NO_QUESTION] in {}", setup.config.name, conversation)
-          processPostGeneration(setup, history, updatedCycle, timers, ctx)
-
-        case ResponseKind.Failed(cause) =>
-          // A failed simulator LLM call is a broken harness, not a real "say nothing". Fail the
-          // run fast instead of leaving this participant silently mute.
-          ctx.log.error("LLM call failed for participant {}", setup.config.name, cause)
-          setup.runner ! ScenarioRunner.ParticipantFailed(setup.config.name, cause)
-          Behaviors.stopped
+    case (ctx, TurnResult(request, allowed, attempt, Success(response))) =>
+      parseTurn(response, allowed) match
+        case Left(problem) if attempt < MaxRetries =>
+          ctx.log.warn("{} made invalid tool calls, retrying: {}", setup.config.name, problem)
+          call(setup, withRetryNote(request, problem), allowed, attempt + 1, ctx)
+          Behaviors.same
+        case Left(problem) =>
+          fail(setup, IllegalStateException(s"Invalid tool calls after a retry: $problem"))
+        case Right(actions) =>
+          val text = Option(response.text).map(_.trim).getOrElse("")
+          if text.nonEmpty then
+            ctx.log.debug("{} wrote text outside tool calls: {}", setup.config.name, text)
+          if actions.isEmpty then ctx.log.info("{} stayed silent (no tool call)", setup.config.name)
+          act(setup, history, actions, timers, ctx)
   }
 
-  private def startGeneration(
-      setup: Setup,
-      history: Map[String, List[ChatMessage]],
-      conversation: String,
-      cycle: CycleState,
-      timers: TimerScheduler[Cmd],
-      ctx: ActorContext[Cmd]
-  ): Behavior[Cmd] =
-    val systemPrompt =
-      buildSystemPrompt(setup.config, conversation, setup.conversations, history)
-
-    val msgs = history.get(conversation) match
-      case Some(base) =>
-        if base.lastOption.exists(_.role == "assistant") then
-          base :+ ChatMessage.user("[system]: It's your turn to respond.")
-        else base
-      case None =>
-        List(ChatMessage.user("[system]: The conversation is starting. Please begin."))
-
-    ctx.pipeToSelf(setup.llm.completeAsync(systemPrompt, msgs)) {
-      case Success(response) =>
-        val text = Option(response).map(_.trim).filter(_.nonEmpty)
-        // Only treat [END] as a termination signal when it's the trailing token, not when
-        // it appears mid-text (which would happen e.g. if the model quoted it).
-        val kind = text match
-          case Some(t) if t.endsWith(Signals.End) =>
-            val remaining = t.stripSuffix(Signals.End).trim
-            if remaining.nonEmpty then ResponseKind.TextThenEnd(remaining)
-            else ResponseKind.End
-          case Some(t) if t == Signals.NoQuestion => ResponseKind.Silent
-          case Some(t) if t.endsWith(Signals.NoQuestion) =>
-            val remaining = t.stripSuffix(Signals.NoQuestion).trim
-            if remaining.nonEmpty then ResponseKind.Text(remaining)
-            else ResponseKind.Silent
-          case Some(t) => ResponseKind.Text(t)
-          case None => ResponseKind.Silent
-        LlmResult(conversation, kind)
-      case Failure(e) =>
-        LlmResult(conversation, ResponseKind.Failed(e))
-    }
-
-    generating(setup, history, conversation, cycle, timers)
+  private def fail(setup: Setup, cause: Throwable): Behavior[Cmd] =
+    setup.runner ! ScenarioRunner.ParticipantFailed(setup.config.name, cause)
+    Behaviors.stopped
 
   /**
-   * After a generation completes, decide what (if anything) to do next within the same cycle.
-   * Always re-enters thinking (full delay) before the next LLM call.
-   *
-   *   1. Reactive drain: pop one conv from `pending` and think before responding there.
-   *   2. Proactive follow-up: when nothing is pending, look for a conv we spoke in earlier this
-   *      cycle, where something happened in another conv since the cycle started (so we may have
-   *      new context worth sharing). Each conv is attempted at most once per cycle; the LLM can
-   *      decline by responding [NO_QUESTION].
-   *   3. Otherwise, return to idle.
+   * Send the turn's messages in order, then end the run if the turn ends with `end_conversation`
+   * ([[parseTurn]] drops anything after it). Otherwise take another turn if something unseen
+   * arrived meanwhile.
    */
-  private def processPostGeneration(
+  private def act(
       setup: Setup,
-      history: Map[String, List[ChatMessage]],
-      cycle: CycleState,
+      history: History,
+      actions: List[TurnAction],
       timers: TimerScheduler[Cmd],
       ctx: ActorContext[Cmd]
   ): Behavior[Cmd] =
-    cycle.pending.toList match
-      case head :: tail =>
-        val updatedCycle = cycle.copy(
-          pending = tail.toSet,
-          proactiveAttempted = cycle.proactiveAttempted + head
+    val name = setup.config.name
+    actions match
+      case TurnAction.Send(conversation, text) :: rest =>
+        setup.runner ! ScenarioRunner.ParticipantResponse(
+          name,
+          conversation,
+          Action.Send(Message(name, text))
         )
-        enterThinking(setup, history, head, updatedCycle, timers, ctx)
+        act(setup, history.add(Line(conversation, name, text, seen = true)), rest, timers, ctx)
+
+      case TurnAction.End :: _ =>
+        // The runner records [END] in a conversation: the one spoken in last.
+        val conversation = history.lines.reverseIterator
+          .collectFirst { case line if !line.kickoff => line.conversation }
+          .orElse(history.lines.lastOption.map(_.conversation))
+          .getOrElse(setup.conversations.head.name)
+        setup.runner ! ScenarioRunner.ParticipantResponse(name, conversation, Action.End)
+        goIdle(setup, history, timers)
 
       case Nil =>
-        // Check if any conversation grew during this cycle — if so, we may have new
-        // cross-conversation context worth proactively relaying to other conversations.
-        val crossConvActivity = history.exists { (conv, msgs) =>
-          msgs.size > cycle.historyAtCycleStart.getOrElse(conv, Nil).size
-        }
-        val proactive =
-          if !crossConvActivity then None
-          else
-            // Look for a conv where we last spoke and haven't already visited this cycle.
-            // The just-completed conv is in proactiveAttempted, so we won't loop on it.
-            history.collectFirst {
-              case (conv, msgs)
-                  if !cycle.proactiveAttempted.contains(conv)
-                    && msgs.nonEmpty
-                    && msgs.lastOption.exists(_.role == "assistant") =>
-                conv
-            }
+        if history.hasUnseen then enterThinking(setup, history, timers, ctx)
+        else goIdle(setup, history, timers)
 
-        proactive match
-          case Some(conv) =>
-            val updatedCycle = cycle.copy(proactiveAttempted = cycle.proactiveAttempted + conv)
-            enterThinking(setup, history, conv, updatedCycle, timers, ctx)
-          case None =>
-            idle(setup, history, timers)
+  /** The turn's actions, or why its tool calls are invalid. */
+  private[actor] def parseTurn(
+      response: LlmResponse,
+      allowed: List[String]
+  ): Either[String, List[TurnAction]] =
+    // Calls after end_conversation never run (the run ends), so they aren't validated: an invalid
+    // one must not cancel a valid ending.
+    val all = Option(response.toolCalls).getOrElse(Nil)
+    val endAt = all.indexWhere(_.name == EndConversation)
+    val calls = if endAt >= 0 then all.take(endAt + 1) else all
+    val parsed = calls.map { call =>
+      val arguments = Option(call.arguments).getOrElse(Json.Null)
+      val args = arguments.hcursor
+      call.name match
+        // Every tool's schema is an object, so anything else is malformed, even for a tool that
+        // takes no arguments: a broken end_conversation must not end the run.
+        case name if !arguments.isObject =>
+          Left(s"$name needs a JSON object as arguments, got ${arguments.noSpaces}")
+        case SendMessage =>
+          (args.get[String]("conversation").toOption, args.get[String]("text").toOption) match
+            case (Some(conv), _) if !allowed.contains(conv) =>
+              Left(
+                s"""$SendMessage to "$conv", which is not one of ${allowed.mkString(", ")}"""
+              )
+            case (Some(conv), Some(text)) if text.trim.nonEmpty =>
+              Right(TurnAction.Send(conv, text.trim))
+            case _ =>
+              Left(s"$SendMessage needs a conversation and non-empty text, got ${call.arguments}")
+        case EndConversation => Right(TurnAction.End)
+        case other => Left(s"unknown tool $other")
+    }
+    val problems = parsed.collect { case Left(problem) => problem }
+    if problems.nonEmpty then Left(problems.mkString("; "))
+    else Right(parsed.collect { case Right(action) => action })
 
-  private def appendToHistory(
+  private def withRetryNote(request: LlmRequest, problem: String): LlmRequest =
+    val note =
+      s"\n\n[system]: Your last reply was rejected and nothing was sent: $problem. Try again."
+    request.copy(messages =
+      request.messages.init :+ ChatMessage.user(request.messages.last.content + note)
+    )
+
+  private def turnTools(allowed: List[String]): List[LlmTool] =
+    List(
+      LlmTool(
+        SendMessage,
+        "Send a message in one of your conversations. Only that conversation's participants " +
+          "see it. Call it once per message; you may send to several conversations in one turn.",
+        Json.obj(
+          "type" -> "object".asJson,
+          "properties" -> Json.obj(
+            "conversation" -> Json.obj(
+              "type" -> "string".asJson,
+              "enum" -> allowed.asJson,
+              "description" -> "The conversation to post in.".asJson
+            ),
+            "text" -> Json.obj(
+              "type" -> "string".asJson,
+              "description" -> "The message, exactly as its readers should see it.".asJson
+            )
+          ),
+          "required" -> List("conversation", "text").asJson
+        )
+      ),
+      LlmTool(
+        EndConversation,
+        "End the whole simulation. Only when your goal is achieved or the others have clearly " +
+          "wrapped up.",
+        Json.obj("type" -> "object".asJson, "properties" -> Json.obj())
+      )
+    )
+
+  /**
+   * The timeline of the `shown` conversations as one transcript, lines tagged with sender and
+   * conversation. On a kickoff turn the nudge asks to open the `opening` conversation.
+   */
+  private def renderTimeline(
+      name: String,
+      history: History,
+      shown: Set[String],
+      opening: Option[String]
+  ): String =
+    val lines = history.lines.collect {
+      case line if shown(line.conversation) =>
+        val who = if line.sender == name then "you" else line.sender
+        val marker = if line.seen then "" else "(new) "
+        s"$marker[$who in ${line.conversation}]: ${line.content}"
+    }
+    val nudge = opening match
+      case Some(conv) =>
+        s"""[system]: Open "$conv" now: call $SendMessage there with your opening message."""
+      case None =>
+        s"[system]: It's your turn. Call $SendMessage for each message you want to send, " +
+          "or call no tool to stay silent."
+    (lines :+ "" :+ nudge).mkString("\n")
+
+  private def buildSystemPrompt(
       config: ParticipantConfig,
-      history: Map[String, List[ChatMessage]],
-      msg: Message,
-      conversation: String
-  ): Map[String, List[ChatMessage]] =
-    val msgs = history.getOrElse(conversation, Nil)
-    val role = if msg.sender == config.name then "assistant" else "user"
-    val content =
-      if role == "assistant" then msg.content
-      else s"[${msg.sender}]: ${msg.content}"
+      conversations: List[ConversationConfig],
+      started: Set[String]
+  ): String =
+    // Status comes from the conversations themselves, not from what this turn offers: an opening
+    // turn offers one conversation, but the others are no less started.
+    val conversationList = conversations.map { conv =>
+      val others = conv.between.filter(_ != config.name).mkString(", ")
+      val notStarted = conv.initiatedBy match
+        case Some(_) if started(conv.name) => ""
+        case Some(initiator) if initiator == config.name => " (not started yet: you open it)"
+        case Some(initiator) => s" (not started yet: you can post here once $initiator has)"
+        case None => ""
+      s"""- "${conv.name}" with: $others$notStarted"""
+    }
 
-    // Merge consecutive messages with the same role
-    val updatedMsgs = msgs.lastOption match
-      case Some(last) if last.role == role =>
-        msgs.init :+ ChatMessage(role, s"${last.content}\n$content")
-      case _ =>
-        msgs :+ ChatMessage(role, content)
+    // How the harness works: included with or without a template, like the [END] rule used to be.
+    val harness =
+      s"""You are in these conversations:
+${conversationList.mkString("\n")}
 
-    history + (conversation -> updatedMsgs)
+You see all of them in one timeline, in order. Each line is tagged [sender in conversation]; your own lines are tagged [you in conversation], and lines marked (new) arrived since your last turn.
+
+To send a message, call $SendMessage with the conversation and the text. A message reaches only the participants of that conversation, so address them, not participants of your other conversations. You may call $SendMessage several times in one turn, for example to answer in one conversation and ask something in another. If nothing needs saying, call no tool: you stay silent, and get another turn when someone writes to you. Text outside tool calls is never delivered.
+
+Call $EndConversation ONLY when the conversation is genuinely complete: your goal has been achieved or the other party has clearly wrapped up. Never end while you are mid-task, waiting for information, or correcting yourself. When in doubt, do not end."""
+
+    config.template.map(_.trim).filter(_.nonEmpty) match
+      case Some(template) => s"$template\n\n$harness"
+      case None =>
+        s"""You are role-playing as a simulated participant.
+
+Your name/role: ${config.name}
+Your persona: ${config.persona}
+Your goal: ${config.goal}
+
+Stay in character. Respond naturally based on the conversation so far.
+
+$harness"""

@@ -26,6 +26,7 @@ import javax.net.ssl.{SSLContext, TrustManagerFactory}
 
 import scala.concurrent.{ExecutionContext, Future}
 import scala.jdk.FutureConverters.*
+import scala.util.{Failure, Success, Try}
 
 import io.circe.*
 import io.circe.parser.*
@@ -49,17 +50,22 @@ class AnthropicClient(
     val requestBody = request.asJson.noSpaces
     sendWithRetry(requestBody)
 
-  override def completeChat(system: String, messages: List[ChatMessage]): CompletionStage[String] =
-    val request = CreateMessageRequest(
+  override def complete(request: LlmRequest): CompletionStage[LlmResponse] =
+    val tools = request.tools.map { tool =>
+      Json.obj(
+        "name" -> tool.name.asJson,
+        "description" -> tool.description.asJson,
+        "input_schema" -> tool.inputSchema
+      )
+    }
+    val apiRequest = CreateMessageRequest(
       model = Settings.defaultModel,
       maxTokens = 2048,
-      system = system,
-      messages = messages.map(_.toJson)
+      system = request.system,
+      messages = request.messages.map(_.toJson),
+      tools = tools
     )
-    createMessage(request).map(textOf).asJava
-
-  private def textOf(response: CreateMessageResponse): String =
-    response.content.collectFirst { case ContentBlock.TextBlock(t) => t }.getOrElse("")
+    createMessage(apiRequest).flatMap(r => Future.fromTry(AnthropicClient.toLlmResponse(r))).asJava
 
   private def sendWithRetry(
       requestBody: String,
@@ -95,6 +101,32 @@ class AnthropicClient(
       }
 
 object AnthropicClient:
+
+  /** Stop reasons for a reply the model finished: it ended its turn, or stopped to call tools. */
+  private val FinishedStopReasons = Set("end_turn", "tool_use")
+
+  /**
+   * The response's text blocks joined by newlines, and its tool calls in order. A reply the model
+   * didn't finish fails instead (cut off at max_tokens or the context window, refused, paused): a
+   * participant cut off before its tool call would read as silent, and one cut off after a call
+   * would act on part of its turn. Reasons are allowed, not denied, so a new one fails loudly.
+   */
+  private[llm] def toLlmResponse(response: CreateMessageResponse): Try[LlmResponse] =
+    if !FinishedStopReasons(response.stopReason) then
+      Failure(
+        IllegalStateException(
+          s"Reply ${response.id} did not finish: stop_reason ${response.stopReason}"
+        )
+      )
+    else
+      Success(
+        LlmResponse(
+          text = response.content.collect { case ContentBlock.TextBlock(t) => t }.mkString("\n"),
+          toolCalls = response.content.collect { case ContentBlock.ToolUseBlock(_, name, input) =>
+            LlmToolCall(name, input)
+          }
+        )
+      )
 
   def create()(using ExecutionContext): AnthropicClient =
     val sslContext = Settings.caCertsPath
